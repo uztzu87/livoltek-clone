@@ -1,0 +1,16 @@
+{
+  "domain": "livoltek",
+  "name": "Livoltek",
+  "codeowners": [
+    "@adamlonsdale"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/adamlonsdale/hass-livoltek",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/adamlonsdale/hass-livoltek/issues",
+  "requirements": [
+    "pylivoltek==1.0.9"
+  ],
+  "version": "0.0.1"
+}

@@ -1,0 +1,15 @@
+default_config:
+
+logger:
+  default: info
+  logs:
+    custom_components.livoltek: debug
+    urllib3: info
+    pylivoltek: info
+    homeassistant.setup: error
+    homeassistant.loader: error
+    homeassistant.components.sensor: info
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies: 127.0.0.1
