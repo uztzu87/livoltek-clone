@@ -33,8 +33,26 @@ interface LivoltekSiteData {
   lastUpdate: string;
 }
 
-// Step 1: Login with secuid and key to get a fresh token
-async function livoltekLogin(): Promise<string> {
+interface LoginResult {
+  authToken: string;
+  userToken: string;
+}
+
+// Helper to decode JWT payload (without verification - just for extracting data)
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return {};
+    const payload = parts[1];
+    const decoded = Buffer.from(payload, "base64").toString("utf-8");
+    return JSON.parse(decoded);
+  } catch {
+    return {};
+  }
+}
+
+// Step 1: Login with secuid and key to get auth token and extract userToken
+async function livoltekLogin(): Promise<LoginResult> {
   const secuid = process.env.LIVOLTEK_SECURITY_ID;
   const rawKey = process.env.LIVOLTEK_API_KEY;
 
@@ -42,8 +60,7 @@ async function livoltekLogin(): Promise<string> {
     throw new Error("Missing LIVOLTEK_SECURITY_ID or LIVOLTEK_API_KEY environment variables");
   }
 
-  // FIX #1: Properly handle escaped characters in the API key
-  // The key may contain literal "\r\n" strings that need to be converted to actual control chars
+  // Handle escaped characters in the API key
   const key = rawKey.replace(/\\r/g, "\r").replace(/\\n/g, "\n");
 
   console.log("Logging in to Livoltek API...");
@@ -73,29 +90,49 @@ async function livoltekLogin(): Promise<string> {
     throw new Error(`Login failed: ${result.message || result.msg_code || "Unknown error"}`);
   }
 
-  // FIX #2: Token is directly in result.data, not result.data.data
-  const token = result.data;
-  if (!token || typeof token !== "string") {
-    throw new Error(`No token returned from login. Got: ${JSON.stringify(result.data)}`);
+  // FIX: Token is nested in result.data.data (not result.data)
+  const authToken = result.data?.data;
+  if (!authToken || typeof authToken !== "string") {
+    throw new Error(`No token returned from login. Response structure: ${JSON.stringify(result.data)}`);
   }
 
-  console.log("Login successful, token length:", token.length);
-  return token;
+  // Extract user ID from JWT payload to use as userToken
+  const payload = decodeJwtPayload(authToken);
+  console.log("JWT payload:", JSON.stringify(payload));
+
+  // The user info is stored as a JSON string in the "user" field
+  let userToken = process.env.LIVOLTEK_USER_TOKEN || "";
+
+  if (payload.user && typeof payload.user === "string") {
+    try {
+      const userInfo = JSON.parse(payload.user);
+      // Use the user's ID as userToken
+      userToken = userInfo.id || userToken;
+      console.log("Extracted userToken from JWT:", userToken);
+    } catch (e) {
+      console.warn("Could not parse user info from JWT:", e);
+    }
+  }
+
+  if (!userToken) {
+    throw new Error("Could not determine userToken. Set LIVOLTEK_USER_TOKEN env variable.");
+  }
+
+  console.log("Login successful!");
+  console.log("Auth token length:", authToken.length);
+  console.log("User token:", userToken);
+
+  return { authToken, userToken };
 }
 
-// Step 2: Make authenticated API requests using the token
+// Step 2: Make authenticated API requests
 async function livoltekRequest(
-  token: string,
+  authToken: string,
+  userToken: string,
   endpoint: string,
   method: "GET" | "POST" = "GET",
   queryParams?: Record<string, string>
 ): Promise<Record<string, unknown>> {
-  // userToken is required as query parameter for most endpoints
-  const userToken = process.env.LIVOLTEK_USER_TOKEN;
-  if (!userToken) {
-    throw new Error("Missing LIVOLTEK_USER_TOKEN environment variable");
-  }
-
   const params = new URLSearchParams({
     userToken,
     ...queryParams,
@@ -103,14 +140,15 @@ async function livoltekRequest(
 
   const url = `${LIVOLTEK_API_BASE}${endpoint}?${params.toString()}`;
   console.log(`Livoltek API: ${method} ${endpoint}`);
+  console.log(`Using userToken: ${userToken}`);
 
   const response = await fetch(url, {
     method,
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      // FIX #3: Token is passed directly, NOT as "Bearer <token>"
-      Authorization: token,
+      // Auth token goes in Authorization header (no Bearer prefix)
+      Authorization: authToken,
     },
     cache: "no-store",
   });
@@ -122,29 +160,36 @@ async function livoltekRequest(
     throw new Error(`API error: ${response.status} - ${text.substring(0, 200)}`);
   }
 
-  return JSON.parse(text);
+  const json = JSON.parse(text);
+
+  // Check for API-level errors
+  if (json.code && json.code !== "200" && json.code !== "operate.success") {
+    throw new Error(`API error: ${json.message || json.code}`);
+  }
+
+  return json;
 }
 
 // Fetch data from Livoltek API
 async function fetchLivoltekData(): Promise<{ data: LivoltekSiteData; source: string }> {
-  // Step 1: Login to get token
-  const token = await livoltekLogin();
+  // Step 1: Login to get tokens
+  const { authToken, userToken } = await livoltekLogin();
 
   // Step 2: Get site list
-  const sitesResponse = await livoltekRequest(token, "/hess/api/userSites/list", "GET", {
+  const sitesResponse = await livoltekRequest(authToken, userToken, "/hess/api/userSites/list", "GET", {
     page: "1",
     size: "10",
   });
 
   console.log("Sites response:", JSON.stringify(sitesResponse, null, 2));
 
-  // Extract sites from response - according to OpenAPI spec, it's in data.list
+  // Extract sites from response
   const responseData = sitesResponse.data as Record<string, unknown> | undefined;
   if (!responseData) {
     throw new Error(`No data in response: ${JSON.stringify(sitesResponse)}`);
   }
 
-  // Sites are in the 'list' property according to OpenAPI spec
+  // Sites are in the 'list' property
   let sites: Array<Record<string, unknown>> = [];
   if (responseData.list && Array.isArray(responseData.list)) {
     sites = responseData.list as Array<Record<string, unknown>>;
@@ -158,7 +203,7 @@ async function fetchLivoltekData(): Promise<{ data: LivoltekSiteData; source: st
 
   const site = sites[0];
 
-  // FIX #4: Use correct field names from OpenAPI spec
+  // Use correct field names from OpenAPI spec
   const siteId = String(site.powerStationId || "");
   const siteName = String(site.powerStationName || "Solar Site");
 
@@ -169,46 +214,44 @@ async function fetchLivoltekData(): Promise<{ data: LivoltekSiteData; source: st
   console.log(`Found site: ${siteName} (${siteId})`);
 
   // Step 3: Get site overview
-  const overviewResponse = await livoltekRequest(token, `/hess/api/site/${siteId}/overview`, "GET");
+  const overviewResponse = await livoltekRequest(authToken, userToken, `/hess/api/site/${siteId}/overview`, "GET");
   const overview = (overviewResponse.data || {}) as Record<string, unknown>;
 
   // Step 4: Get current power flow
-  const powerflowResponse = await livoltekRequest(token, `/hess/api/site/${siteId}/curPowerflow`, "GET");
+  const powerflowResponse = await livoltekRequest(authToken, userToken, `/hess/api/site/${siteId}/curPowerflow`, "GET");
   const powerflow = (powerflowResponse.data || {}) as Record<string, unknown>;
 
   // Step 5: Get ESS (battery) information
   let essData: Record<string, unknown> = {};
   try {
-    const essResponse = await livoltekRequest(token, `/hess/api/site/${siteId}/ESS`, "GET");
+    const essResponse = await livoltekRequest(authToken, userToken, `/hess/api/site/${siteId}/ESS`, "GET");
     essData = (essResponse.data || {}) as Record<string, unknown>;
   } catch (e) {
     console.warn("Could not fetch ESS data:", e);
   }
 
-  // Map power values using correct field names from OpenAPI spec
-  const pvPower = parseFloat(String(powerflow.pvPower || 0)) / 1000; // Convert W to kW
+  // Map power values (convert W to kW)
+  const pvPower = parseFloat(String(powerflow.pvPower || 0)) / 1000;
   const batteryPower = parseFloat(String(powerflow.energyPower || 0)) / 1000;
   const gridPower = parseFloat(String(powerflow.powerGridPower || 0)) / 1000;
   const loadPower = parseFloat(String(powerflow.loadPower || 0)) / 1000;
   const batteryLevel = parseFloat(String(powerflow.energySoc || essData.currentSoc || 0));
 
-  // Map energy values from overview (using correct field names)
+  // Map energy values from overview
   const todayEnergy = parseFloat(String(overview.eoutDaily || 0));
   const monthEnergy = parseFloat(String(overview.eoutMonth || 0));
   const totalEnergy = parseFloat(String(overview.eTotalToGrid || 0));
 
-  // Calculate savings (if not provided by API)
-  // Using average electricity rate - adjust for your region
-  const electricityRate = parseFloat(process.env.ELECTRICITY_RATE || "0.17"); // USD per kWh
+  // Calculate savings
+  const electricityRate = parseFloat(process.env.ELECTRICITY_RATE || "0.17");
   const todaySavings = todayEnergy * electricityRate;
   const monthSavings = monthEnergy * electricityRate;
   const totalSavings = totalEnergy * electricityRate;
 
   // CO2 calculation: ~0.4 kg CO2 per kWh avoided
-  const co2Factor = 0.4;
-  const co2Avoided = totalEnergy * co2Factor;
+  const co2Avoided = totalEnergy * 0.4;
 
-  // Determine status based on powerStationStatus
+  // Determine status
   const statusValue = site.powerStationStatus;
   let status: "online" | "offline" | "warning" = "offline";
   if (statusValue === 1 || pvPower > 0) {
